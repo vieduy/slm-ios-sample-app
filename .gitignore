@@ -1,0 +1,32 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+# SPM
+.swiftpm/
+.build/
+Packages/
+
+# Generated xcframeworks (produced by scripts/bootstrap.sh)
+Frameworks/
+
+# Bundled model (large, user-provided, copied in by bootstrap.sh)
+Resources/*.litertlm
+Resources/*.xnnpack_cache_*
+
+# Local model zoo (each file >100MB — exceeds GitHub's limit; not for git)
+models/
+
+# Local tooling / agent state
+.claude/
+
+# Blog drafts (kept private for now)
+BLOG_*.md
+
+# macOS
+.DS_Store

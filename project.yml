@@ -1,0 +1,75 @@
+name: Gemma3Translator
+options:
+  bundleIdPrefix: com.example.gemma
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    # GemmaBridge.mm includes gemma_engine.h (C++); needs c++17.
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_CXX_LIBRARY: "libc++"
+    # Xcode 26 splits Debug builds into host + .debug.dylib, which the
+    # iOS 26 simulator rejects with IXErrorDomain 13 "Missing bundle ID".
+    # Force single-binary Debug builds (same fix as the matmoe sample).
+    ENABLE_DEBUG_DYLIB: NO
+
+targets:
+  Gemma3Translator:
+    type: application
+    platform: iOS
+    sources:
+      - path: Gemma3Translator
+        excludes:
+          - Info.plist
+      # Resources/ is an ordinary group, NOT type: folder. Folder references
+      # ship as opaque blue folders that Xcode's signing step does not
+      # enumerate, leaving Info.plist outside the code signature
+      # -> "Missing bundle ID" on install. Cost: re-run xcodegen if you add
+      # a new file under Resources/.
+      - path: Resources
+        optional: true
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.gemma.Gemma3Translator
+        PRODUCT_NAME: Gemma3Translator
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        # Info.plist is fully hardcoded (no $(VAR), no merged keys). Avoids
+        # Xcode 26.3 dropping CFBundleIdentifier when GENERATE_INFOPLIST_FILE
+        # is on with a custom INFOPLIST_FILE.
+        INFOPLIST_FILE: Gemma3Translator/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_OBJC_BRIDGING_HEADER: Gemma3Translator/Gemma3Translator-Bridging-Header.h
+        # GemmaEngine.xcframework ships our gemma_engine.h.
+        # CLiteRTLM.xcframework ships the LiteRT-LM C API
+        # (only needed transitively; engine.h is consumed by gemma_engine.cpp).
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/Frameworks/GemmaEngine.xcframework/Headers
+          - $(SRCROOT)/Frameworks/GemmaEngine.xcframework/ios-arm64/Headers
+          - $(SRCROOT)/Frameworks/GemmaEngine.xcframework/ios-arm64-simulator/Headers
+          - $(SRCROOT)/Frameworks/GemmaEngine.xcframework/ios-arm64_x86_64-simulator/Headers
+        OTHER_LDFLAGS:
+          - -lc++
+        # Embedded dynamic frameworks need to load from the app bundle's
+        # Frameworks/ directory.
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - "@executable_path/Frameworks"
+          - "@loader_path/Frameworks"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    dependencies:
+      # Both xcframeworks are dynamic dylibs (LiteRT-LM is a shared library;
+      # libgemma_engine.dylib links against it). Embed + sign both.
+      - framework: Frameworks/GemmaEngine.xcframework
+        embed: true
+        sign: true
+      - framework: Frameworks/CLiteRTLM.xcframework
+        embed: true
+        sign: true
