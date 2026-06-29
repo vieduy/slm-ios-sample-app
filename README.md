@@ -1,8 +1,19 @@
-# Gemma3 iOS Sample App
+# SLM iOS Sample App
 
-A minimal SwiftUI app that runs **Gemma-3 270M-IT** on-device via
-`GemmaEngine.xcframework` + `CLiteRTLM.xcframework`. Used as the reference
-integration target for the mobile team.
+A minimal SwiftUI app that runs small language models **on-device** via two
+swappable engines:
+
+- **LiteRT-LM** (`GemmaEngine.xcframework` + `CLiteRTLM.xcframework`) — runs
+  `.litertlm` models (e.g. Gemma-3 270M-IT).
+- **llama.cpp** (`llama.xcframework`) — runs `.gguf` models, including the
+  **1-bit Bonsai-1.7B (Q1_0, qwen3 arch)**.
+
+The active engine is chosen automatically by which model file is in the bundle
+(`.gguf` → llama.cpp, `.litertlm` → LiteRT-LM); see `InferenceEngine.swift`.
+Both bridges expose the *same* selectors, so the SwiftUI/view-model layer is
+engine-agnostic. Used as the reference integration target for the mobile team.
+
+> **llama.cpp / Bonsai users: jump to [llama.cpp engine (Bonsai 1-bit GGUF)](#llamacpp-engine--bonsai-1-bit-gguf).**
 
 ```
 [ direction picker  EN→VI | VI→EN ]
@@ -18,6 +29,75 @@ integration target for the mobile team.
 
 ---
 
+## llama.cpp engine — Bonsai 1-bit (GGUF)
+
+Runs `.gguf` models through **mainline-compatible llama.cpp** built into
+`llama.xcframework` (Metal embedded). Validated with the **finetuned
+Bonsai-1.7B Q1_0** (qwen3 architecture, ~231 MB on disk, ~1.125 bpw).
+
+### Setup
+
+```bash
+cd gemma-3/inference/sample-ios-app
+
+# 1. Build the llama.cpp xcframework (prism fork by default; mainline works too).
+#    First run downloads + compiles llama.cpp for Apple platforms (~several min).
+bash scripts/build_llama_xcframework.sh
+
+# 2. Drop a GGUF as Resources/model.gguf  (gitignored — 100MB+).
+cp /path/to/bonsai-1.7b-...-Q1_0.gguf Resources/model.gguf
+
+# 3. Generate the project and build/run.
+xcodegen generate
+open Gemma3Translator.xcodeproj          # or: scripts/run_sim.sh
+```
+
+`bootstrap.sh` builds the LiteRT-LM frameworks; the llama.cpp framework is
+built by the dedicated `build_llama_xcframework.sh` above. You only need the
+engine matching the model you bundle.
+
+### Key behavior (`LlamaBridge.mm`)
+
+- **CPU is the recommended (and reliable) backend.** The bridge pins CPU mode
+  to the `CPU` + `BLAS (Accelerate)` ggml devices and excludes Metal — this
+  removes a one-time ~14 s Metal shader compile at launch and hundreds of
+  per-token graph splits, while BLAS still accelerates prefill.
+- **Thinking is disabled.** Bonsai/qwen3 are reasoning models whose template
+  emits `<think>…</think>`. `llama_chat_apply_template` (no jinja) drops the
+  template's empty-think block, so the bridge re-appends `<think>\n\n</think>`
+  after the assistant header (the model's own no-think format).
+- **Threads** = all cores (decode is compute-bound on the generic Q1_0 ARM
+  kernel and scales with cores). `n_ctx` is capped (1024) to keep the KV cache
+  small on memory-constrained devices.
+- **Diagnostics**: at load it logs `[[CPUINFO]] DotProd=… I8MM=…` and
+  `[[LLAMA]] reqBackend=… useGpu=…` to stderr (capture with
+  `devicectl … --console`).
+
+### ⚠️ GPU/Metal is unusable on older devices (e.g. A12 / iPhone XS)
+
+On the iPhone XS the model **fully offloads to the A12 Metal GPU (29/29
+layers) but produces incorrect output** — the A12 lacks `simdgroup
+matmul`/`reduction`, which ggml-metal's matvec kernels need. Even setting that
+aside, the A12 GPU wouldn't beat CPU for batch-1 decode (shared/unified memory
+= no bandwidth edge). **Use CPU on the XS.** Newer GPUs (A17+/Apple Silicon)
+run Metal correctly and fast. The CPU/GPU toggle remains for newer hardware.
+
+### Performance reality (iPhone XS / A12)
+
+| | CPU | notes |
+|---|---|---|
+| Decode | ~6 tok/s | hardware ceiling — see below |
+| Prefill | ~21 tok/s | BLAS-accelerated |
+| Peak RAM | ~0.5 GB | weights mmap'd + ~112 MiB KV @ n_ctx 1024 |
+
+Decode is compute-bound on the generic Q1_0 kernel. The A12 lacks the `SDOT`
+dot-product unit (added in the A13), so llama.cpp emulates it — but that
+emulation costs only ~18% (measured), so the slowness is mostly the **old chip
+overall**, not the missing instruction. **1-bit saves memory, not arithmetic.**
+For interactive speed on an A12, use a smaller model; newer chips are far faster.
+
+---
+
 ## File layout
 
 ```
@@ -29,16 +109,19 @@ sample-ios-app/
 │   ├── TranslationViewModel.swift       @MainActor warm-up, generate on detached Task
 │   ├── TranslationDirection.swift       .enToVi / .viToEn + short prompt template
 │   ├── ResourceLookup.swift             Bundle.main path helper
-│   ├── GemmaBridge.h / .mm              Obj-C++ shim over gemma::GemmaEngine
+│   ├── GemmaBridge.h / .mm              Obj-C++ shim over gemma::GemmaEngine (LiteRT-LM)
+│   ├── LlamaBridge.h / .mm              Obj-C++ shim over llama.cpp (GGUF, same selectors)
+│   ├── InferenceEngine.swift           protocol + runtime auto-select by model extension
 │   ├── Gemma3Translator-Bridging-Header.h
 │   └── Info.plist                       hardcoded (see "Implementation notes")
-├── Resources/                           ← drop model.litertlm here (gitignored)
-│   └── model.litertlm
-├── Frameworks/                          ← populated by scripts/bootstrap.sh
-│   ├── GemmaEngine.xcframework
-│   └── CLiteRTLM.xcframework
+├── Resources/                           ← drop model.litertlm OR model.gguf here (gitignored)
+├── Frameworks/                          ← populated by the build scripts
+│   ├── GemmaEngine.xcframework          (LiteRT-LM path)
+│   ├── CLiteRTLM.xcframework            (LiteRT-LM path)
+│   └── llama.xcframework                (llama.cpp / GGUF path)
 └── scripts/
     ├── bootstrap.sh                     fetch CLiteRTLM, build GemmaEngine, copy model, xcodegen
+    ├── build_llama_xcframework.sh       build llama.xcframework (llama.cpp / Bonsai path)
     └── run_sim.sh                       boot sim, build, install, launch
 ```
 

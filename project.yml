@@ -73,3 +73,9 @@ targets:
       - framework: Frameworks/CLiteRTLM.xcframework
         embed: true
         sign: true
+      # llama.cpp engine (drives .gguf models, e.g. Bonsai-1.7B Q1_0). Built by
+      # bootstrap.sh from mainline llama.cpp via build-xcframework.sh; a dynamic
+      # framework with Metal embedded. LlamaBridge.mm imports <llama/llama.h>.
+      - framework: Frameworks/llama.xcframework
+        embed: true
+        sign: true

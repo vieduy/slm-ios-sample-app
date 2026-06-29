@@ -17,10 +17,11 @@ final class TranslationViewModel: ObservableObject {
     @Published var isBenchmarking: Bool = false
     @Published var benchmarkResult: BenchmarkResult?
 
-    private var engine: GemmaBridge?
+    private var engine: (any InferenceEngine)?
     private var activeBackend: GemmaBackend = .cpu
 
     // Resolved once in warmUpIfNeeded(), reused on every backend reload.
+    private var runtime: ModelRuntime = .liteRT
     private var modelPath: String?
     private var baseCacheDir: String?
 
@@ -43,11 +44,12 @@ final class TranslationViewModel: ObservableObject {
 
     func warmUpIfNeeded() async {
         if isReady { return }
-        guard let modelPath = ResourceLookup.path("model", ext: "litertlm") else {
-            errorMessage = "model.litertlm not in bundle — drop into Resources/."
+        guard let resolved = ModelRuntime.resolve() else {
+            errorMessage = "No model in bundle — drop model.gguf or model.litertlm into Resources/."
             return
         }
-        self.modelPath = modelPath
+        self.runtime = resolved.runtime
+        self.modelPath = resolved.path
         // Writable kernel-cache dir. Without this LiteRT-LM tries to write the
         // XNNPACK cache next to the model — which lives in the read-only .app
         // bundle on iOS, so every cold launch rebuilds it (~1-2 s wasted).
@@ -72,10 +74,12 @@ final class TranslationViewModel: ObservableObject {
         timing = "Loading model on \(requested.label)…"
 
         let baseCacheDir = self.baseCacheDir
+        let runtime = self.runtime
         let t0 = Date()
-        let outcome: (GemmaBridge, GemmaBackend, Bool)? =
+        let outcome: (any InferenceEngine, GemmaBackend, Bool)? =
             await Task.detached(priority: .userInitiated) {
                 if let b = Self.tryLoad(modelPath: modelPath,
+                                        runtime: runtime,
                                         backend: requested,
                                         baseCacheDir: baseCacheDir) {
                     return (b, requested, false)
@@ -83,6 +87,7 @@ final class TranslationViewModel: ObservableObject {
                 // GPU couldn't load — retry on CPU so the app stays usable.
                 if requested == .gpu,
                    let b = Self.tryLoad(modelPath: modelPath,
+                                        runtime: runtime,
                                         backend: .cpu,
                                         baseCacheDir: baseCacheDir) {
                     return (b, .cpu, true)
@@ -109,8 +114,9 @@ final class TranslationViewModel: ObservableObject {
     /// Build a backend-specific GemmaBridge, or nil if Init fails. The kernel
     /// cache is namespaced per backend so a CPU cache never feeds a GPU load.
     private nonisolated static func tryLoad(modelPath: String,
+                                            runtime: ModelRuntime,
                                             backend: GemmaBackend,
-                                            baseCacheDir: String?) -> GemmaBridge? {
+                                            baseCacheDir: String?) -> (any InferenceEngine)? {
         var cacheDir: String? = nil
         if let base = baseCacheDir {
             let dir = (base as NSString).appendingPathComponent(backend.rawValue)
@@ -118,9 +124,10 @@ final class TranslationViewModel: ObservableObject {
                                                      withIntermediateDirectories: true)
             cacheDir = dir
         }
-        let b = GemmaBridge()
+        // GemmaBridge uses cacheDir (XNNPACK kernel cache); LlamaBridge ignores it.
+        let b = runtime.makeEngine()
         // Benchmark instrumentation on: lets the engine report prefill vs decode
-        // tok/s separately (see runBenchmark). Harmless for normal translation.
+        // tok/s separately (see runBenchmark). Harmless for normal use.
         return b.load(modelPath: modelPath,
                       backend: backend.rawValue,
                       cacheDir: cacheDir,
@@ -338,7 +345,7 @@ final class TranslationViewModel: ObservableObject {
     /// One streamed generation. `stream(...)` runs the whole decode loop
     /// synchronously on this thread and fires `onChunk` per token, so the
     /// counters are fully settled by the time it returns.
-    private nonisolated static func streamOnce(engine: GemmaBridge,
+    private nonisolated static func streamOnce(engine: any InferenceEngine,
                                                prompt: String,
                                                maxTokens: Int32)
         -> (ttftMs: Double, totalMs: Double, tokens: Int, text: String) {

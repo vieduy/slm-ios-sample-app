@@ -17,6 +17,7 @@ Frameworks/
 
 # Bundled model (large, user-provided, copied in by bootstrap.sh)
 Resources/*.litertlm
+Resources/*.gguf
 Resources/*.xnnpack_cache_*
 
 # Local model zoo (each file >100MB — exceeds GitHub's limit; not for git)
