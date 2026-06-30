@@ -1,10 +1,37 @@
 import Foundation
 import SwiftUI
 
+/// Selectable LoRA adapter for the llama.cpp engine. `.base` = no adapter (pure
+/// base model); the others map to bundled `<resource>.gguf` files.
+enum AdapterChoice: String, CaseIterable, Identifiable {
+    case base, adapter1, adapter2
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .base:     return "Base"
+        case .adapter1: return "Adapter 1"
+        case .adapter2: return "Adapter 2"
+        }
+    }
+
+    /// Bundle resource basename (.gguf), or nil for the base model. Doubles as
+    /// the engine-side adapter identifier.
+    var resourceName: String? {
+        switch self {
+        case .base:     return nil
+        case .adapter1: return "adapter_1"
+        case .adapter2: return "adapter_2"
+        }
+    }
+}
+
 @MainActor
 final class TranslationViewModel: ObservableObject {
 
     @Published var direction: TranslationDirection = .enToVi
+    @Published var adapter: AdapterChoice = .base
     @Published var output: String = ""
     @Published var isRunning: Bool = false
     @Published var isReady: Bool = false
@@ -12,6 +39,10 @@ final class TranslationViewModel: ObservableObject {
     @Published var timing: String?
 
     // Benchmark state.
+    // CPU is the faster backend for this 270m model on A12 (iPhone XS): Metal
+    // there is memory-bound at batch-1 decode and incurs heavy graph-split +
+    // kernel-dispatch overhead, measured slower than CPU+BLAS. GPU stays
+    // available via the toggle for measurement, but CPU is the default.
     @Published var backend: GemmaBackend = .cpu
     @Published var benchmarkMode: BenchmarkMode = .short
     @Published var isBenchmarking: Bool = false
@@ -26,9 +57,13 @@ final class TranslationViewModel: ObservableObject {
     private var baseCacheDir: String?
 
     private let maxNewTokens: Int32 = 128
-    private let temperature: Float = 0.2     // translation prefers low temp
-    private let topK: Int32 = 40
-    private let topP: Float = 0.95
+    // Deterministic decoding: temp 0 makes LlamaBridge use the greedy (argmax)
+    // sampler, so the same prompt + adapter always yields the same output —
+    // essential for comparing adapters. top_k=1 / top_p=1 keep it deterministic
+    // even if temperature is ever raised (top_k=1 = always pick the top token).
+    private let temperature: Float = 0.0
+    private let topK: Int32 = 1
+    private let topP: Float = 1.0
 
     // Benchmark uses a generation prompt (not translation) so decode actually
     // runs to the mode's token cap — a translation prompt emits end-of-turn
@@ -104,11 +139,48 @@ final class TranslationViewModel: ObservableObject {
         self.activeBackend = active
         // Keep the published toggle in sync with reality on a GPU→CPU fallback.
         if fellBack { self.backend = active }
+        // Adapters are tied to the model instance, so (re)load them onto the
+        // fresh engine and re-apply the current selection after every reload.
+        self.installAdapters()
         self.isReady = true
         let ms = Int(Date().timeIntervalSince(t0) * 1000)
         self.timing = fellBack
             ? "GPU unavailable — loaded on CPU in \(ms) ms"
             : "Loaded on \(active.label) in \(ms) ms"
+    }
+
+    /// Whether the loaded runtime supports dynamic LoRA (llama.cpp only).
+    var supportsAdapters: Bool { runtime == .llamaCpp }
+
+    /// Load every bundled adapter onto the current engine, then apply the active
+    /// selection. No-op unless the llama.cpp runtime is loaded. Adapter-load
+    /// failures are non-fatal (logged) so the base model stays usable.
+    private func installAdapters() {
+        guard let engine, runtime == .llamaCpp else { return }
+        for choice in AdapterChoice.allCases {
+            guard let name = choice.resourceName,
+                  let path = ResourceLookup.path(name, ext: "gguf") else { continue }
+            if !engine.loadAdapter(path: path, identifier: name) {
+                FileHandle.standardError.write(Data(
+                    "[[LORA]] load failed for \(name): \(engine.lastError)\n".utf8))
+            }
+        }
+        _ = engine.setActiveAdapter(adapter.resourceName, scale: 1.0)
+    }
+
+    /// Switch the active LoRA adapter on the live engine — instant, no model
+    /// reload (the base model stays resident). `.base` reverts to the unmodified
+    /// model.
+    func setAdapter(_ choice: AdapterChoice) {
+        adapter = choice
+        guard let engine, runtime == .llamaCpp, isReady else { return }
+        if engine.setActiveAdapter(choice.resourceName, scale: 1.0) {
+            output = ""
+            timing = choice == .base ? "Adapter: base model"
+                                     : "Adapter: \(choice.label)"
+        } else {
+            errorMessage = engine.lastError
+        }
     }
 
     /// Build a backend-specific GemmaBridge, or nil if Init fails. The kernel

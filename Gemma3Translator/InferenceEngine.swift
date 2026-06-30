@@ -14,6 +14,16 @@ protocol InferenceEngine: AnyObject {
                 onChunk: @escaping (String, Bool) -> Void)
     func resetSession()
     var lastError: String { get }
+
+    // Dynamic LoRA. Only the llama.cpp engine implements these; the LiteRT path
+    // falls through to the no-op defaults below (its text-LoRA call is stubbed).
+    func loadAdapter(path: String, identifier: String) -> Bool
+    func setActiveAdapter(_ identifier: String?, scale: Float) -> Bool
+}
+
+extension InferenceEngine {
+    func loadAdapter(path: String, identifier: String) -> Bool { false }
+    func setActiveAdapter(_ identifier: String?, scale: Float) -> Bool { false }
 }
 
 extension GemmaBridge: InferenceEngine {}

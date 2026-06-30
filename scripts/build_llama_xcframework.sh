@@ -49,6 +49,12 @@ if ! grep -q "GGML_TYPE_Q1_0" "$SRC/ggml/include/ggml.h"; then
   exit 1
 fi
 
+# NOTE on ARM dotprod (SDOT): do NOT enable GGML_CPU_ARM_ARCH=...+dotprod here.
+# Apple's ASIMD dot-product (FEAT_DotProd) only exists on A13+; the iPhone XS
+# (A12) target lacks it and SIGILLs (EXC_BAD_INSTRUCTION) on the first SDOT.
+# Keep the portable baseline build. For speed on A12 use the GPU/Metal backend
+# or a lower-bandwidth quant (Q4_K_M) instead. See memory: llamacpp-dotprod-perf-fix.
+
 # ---- 2. Build the full (all-Apple-platform) xcframework -------------------
 echo "=== Building llama.xcframework (this compiles several Apple platforms)..."
 pushd "$SRC" >/dev/null

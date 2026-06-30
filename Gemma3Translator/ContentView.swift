@@ -9,6 +9,7 @@ struct ContentView: View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 12) {
                 backendPicker
+                if vm.supportsAdapters { adapterPicker }
                 directionPicker
                 inputCard
                 translateButton
@@ -42,6 +43,23 @@ struct ContentView: View {
             .disabled(vm.isRunning || vm.isBenchmarking)
             .onChange(of: vm.backend) { newValue in
                 Task { await vm.reload(to: newValue) }
+            }
+        }
+    }
+
+    private var adapterPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("LoRA adapter")
+                .font(.caption).foregroundStyle(.secondary)
+            Picker("Adapter", selection: $vm.adapter) {
+                ForEach(AdapterChoice.allCases) { a in
+                    Text(a.label).tag(a)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(vm.isRunning || vm.isBenchmarking || !vm.isReady)
+            .onChange(of: vm.adapter) { newValue in
+                vm.setAdapter(newValue)
             }
         }
     }

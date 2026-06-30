@@ -53,6 +53,26 @@ NS_ASSUME_NONNULL_BEGIN
 /// stream call already clears state, so this is mainly for parity.)
 - (void)resetSession;
 
+#pragma mark - Dynamic LoRA
+
+/// Load a LoRA adapter (.gguf, produced by convert_lora_to_gguf.py against the
+/// SAME base architecture) and keep it resident, keyed by `identifier`. The
+/// adapter is tied to the loaded model, so this must be re-called after every
+/// engine (re)load. Idempotent per identifier (a second load replaces the first).
+/// Returns NO on failure — e.g. the adapter's arch/tokenizer doesn't match the
+/// base (see -lastError).
+- (BOOL)loadAdapterAtPath:(NSString *)path
+               identifier:(NSString *)identifier
+    NS_SWIFT_NAME(loadAdapter(path:identifier:));
+
+/// Activate (or blend) a previously-loaded adapter on the live context, taking
+/// effect on the next decode — no model reload. Pass `identifier` = nil/empty to
+/// revert to the pure base model. `scale` is the LoRA strength (1.0 = as trained,
+/// 0.0 = off). Returns NO if `identifier` was never loaded (see -lastError).
+- (BOOL)setActiveAdapter:(nullable NSString *)identifier
+                   scale:(float)scale
+    NS_SWIFT_NAME(setActiveAdapter(_:scale:));
+
 @property (nonatomic, readonly, copy) NSString *lastError;
 
 @end

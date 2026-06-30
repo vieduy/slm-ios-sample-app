@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <sys/sysctl.h>
 
@@ -49,6 +50,10 @@ static void LogCpuFeatures() {
     bool               _benchmark;
     bool               _isThinking; // qwen3/Bonsai-style reasoning model
     int                _nThreads;
+    // Dynamic LoRA: adapters are owned (init'd against _model) and kept resident
+    // so swapping is just a llama_set_adapters_lora() call on the live context.
+    std::vector<llama_adapter_lora *>     _adapters;       // owned, freed in dealloc
+    std::unordered_map<std::string, int>  _adapterIndex;   // identifier -> _adapters[]
 }
 
 - (instancetype)init {
@@ -68,6 +73,12 @@ static void LogCpuFeatures() {
 }
 
 - (void)dealloc {
+    // Free adapters before the model/context they were initialised against.
+    for (llama_adapter_lora *a : _adapters) {
+        if (a) llama_adapter_lora_free(a);
+    }
+    _adapters.clear();
+    _adapterIndex.clear();
     if (_ctx)   llama_free(_ctx);
     if (_model) llama_model_free(_model);
 }
@@ -84,12 +95,21 @@ static void LogCpuFeatures() {
 
     const bool wantGpu = [backend isEqualToString:@"gpu"];
     const bool canGpu  = llama_supports_gpu_offload();
-    // Force the GPU attempt when requested (don't silently gate on canGpu): if
-    // Metal truly can't load, the model load fails and the VM falls back to CPU
-    // *visibly*. This makes "GPU" actually try Metal so we can measure it.
-    const bool useGpu  = wantGpu;
-    fprintf(stderr, "[[LLAMA]] reqBackend=%s wantGpu=%d canGpu=%d useGpu=%d\n",
-            backend.UTF8String, wantGpu, canGpu, useGpu);
+    // Only use Metal when it can actually run. ggml's Metal backend calls
+    // abort() (SIGABRT) on init/load failure rather than returning an error, so
+    // a forced attempt can't be caught and turned into a CPU fallback — it just
+    // crashes. Two guards:
+    //  • iOS Simulator: ggml-metal aborts (no real Metal compute device), so
+    //    force CPU there. Metal can only be measured on a physical device.
+    //  • Device: gate on llama_supports_gpu_offload() so an unsupported build
+    //    cleanly uses CPU instead of aborting.
+#if TARGET_OS_SIMULATOR
+    const bool useGpu = false;
+#else
+    const bool useGpu = wantGpu && canGpu;
+#endif
+    fprintf(stderr, "[[LLAMA]] reqBackend=%s wantGpu=%d canGpu=%d useGpu=%d sim=%d\n",
+            backend.UTF8String, wantGpu, canGpu, useGpu, (int)TARGET_OS_SIMULATOR);
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = useGpu ? 999 : 0;   // 999 = offload all transformer layers
@@ -290,6 +310,66 @@ static void LogCpuFeatures() {
 
 - (void)resetSession {
     if (_ctx) llama_memory_clear(llama_get_memory(_ctx), /*data=*/true);
+}
+
+#pragma mark - Dynamic LoRA
+
+- (BOOL)loadAdapterAtPath:(NSString *)path identifier:(NSString *)identifier {
+    _lastError.clear();
+    if (!_model) { _lastError = "model not loaded"; return NO; }
+    if (path.length == 0 || identifier.length == 0) {
+        _lastError = "loadAdapter: empty path/identifier";
+        return NO;
+    }
+
+    llama_adapter_lora *adapter =
+        llama_adapter_lora_init(_model, path.UTF8String);
+    if (!adapter) {
+        // Most commonly an arch/tokenizer mismatch (adapter trained on a
+        // different base) or a corrupt/incompatible .gguf.
+        _lastError = std::string("llama_adapter_lora_init failed for ") +
+                     path.UTF8String;
+        return NO;
+    }
+
+    // Replace an existing adapter under the same id (free the old one first).
+    std::string key = identifier.UTF8String;
+    auto it = _adapterIndex.find(key);
+    if (it != _adapterIndex.end()) {
+        if (_adapters[it->second]) llama_adapter_lora_free(_adapters[it->second]);
+        _adapters[it->second] = adapter;
+    } else {
+        _adapterIndex[key] = (int)_adapters.size();
+        _adapters.push_back(adapter);
+    }
+    fprintf(stderr, "[[LORA]] loaded adapter '%s' from %s\n",
+            key.c_str(), path.UTF8String);
+    return YES;
+}
+
+- (BOOL)setActiveAdapter:(NSString *)identifier scale:(float)scale {
+    _lastError.clear();
+    if (!_ctx) { _lastError = "engine not loaded"; return NO; }
+
+    // nil/empty identifier → clear all adapters, revert to pure base model.
+    if (identifier.length == 0) {
+        llama_set_adapters_lora(_ctx, nullptr, 0, nullptr);
+        fprintf(stderr, "[[LORA]] active adapter cleared (base model)\n");
+        return YES;
+    }
+
+    auto it = _adapterIndex.find(identifier.UTF8String);
+    if (it == _adapterIndex.end()) {
+        _lastError = std::string("adapter not loaded: ") + identifier.UTF8String;
+        return NO;
+    }
+
+    llama_adapter_lora *adapters[1] = { _adapters[it->second] };
+    float scales[1] = { scale };
+    llama_set_adapters_lora(_ctx, adapters, 1, scales);
+    fprintf(stderr, "[[LORA]] active adapter '%s' scale=%.2f\n",
+            identifier.UTF8String, scale);
+    return YES;
 }
 
 - (NSString *)lastError {
