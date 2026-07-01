@@ -9,10 +9,13 @@ struct ContentView: View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 12) {
                 backendPicker
-                if vm.supportsAdapters { adapterPicker }
                 directionPicker
                 inputCard
-                translateButton
+                if vm.supportsAdapters {
+                    adapterTasksSection
+                } else {
+                    translateButton
+                }
                 benchmarkModePicker
                 benchmarkButton
                 sweepButton
@@ -47,19 +50,82 @@ struct ContentView: View {
         }
     }
 
-    private var adapterPicker: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("LoRA adapter")
-                .font(.caption).foregroundStyle(.secondary)
-            Picker("Adapter", selection: $vm.adapter) {
-                ForEach(AdapterChoice.allCases) { a in
-                    Text(a.label).tag(a)
-                }
+    /// Two task adapters. `Get` downloads the .gguf to disk (no RAM). Its Translate
+    /// button then enables; tapping it loads that adapter into RAM and frees the
+    /// other, so only ONE adapter (~30 MB) is resident at a time. A per-row tag
+    /// shows "in RAM" (resident) vs "on disk" (downloaded, not loaded).
+    private var adapterTasksSection: some View {
+        VStack(spacing: 10) {
+            taskRow(.adapter1, title: "Translate 1")
+            taskRow(.adapter2, title: "Translate 2")
+            loadBothButton
+        }
+    }
+
+    /// Diagnostic: force BOTH adapters resident to compare RAM vs the default
+    /// only-active policy (expect ~2× the single-adapter footprint).
+    private var loadBothButton: some View {
+        Button {
+            Task { await vm.loadBothAdapters() }
+        } label: {
+            HStack {
+                Image(systemName: "square.stack.3d.up")
+                Text("Load both LoRA adapters (check RAM)")
+                    .frame(maxWidth: .infinity)
             }
-            .pickerStyle(.segmented)
-            .disabled(vm.isRunning || vm.isBenchmarking || !vm.isReady)
-            .onChange(of: vm.adapter) { newValue in
-                vm.setAdapter(newValue)
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.bordered)
+        .disabled(vm.downloadedAdapters.count < 2
+                  || vm.residentAdapters.count == 2
+                  || vm.isRunning || vm.isBenchmarking || vm.downloading != nil || !vm.isReady)
+    }
+
+    @ViewBuilder
+    private func taskRow(_ choice: AdapterChoice, title: String) -> some View {
+        let ready = vm.isAdapterReady(choice)
+        let resident = vm.residentAdapters.contains(choice)
+        let inputEmpty = input.trimmingCharacters(in: .whitespaces).isEmpty
+        HStack(spacing: 8) {
+            Button {
+                Task { await vm.translate(using: choice, input) }
+            } label: {
+                HStack {
+                    if vm.isRunning && vm.adapter == choice {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(title).frame(maxWidth: .infinity)
+                }
+                .padding(.vertical, 10)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!ready || vm.isRunning || vm.isBenchmarking || !vm.isReady || inputEmpty)
+
+            if ready {
+                VStack(spacing: 2) {
+                    Image(systemName: resident ? "memorychip.fill" : "internaldrive")
+                        .foregroundStyle(resident ? .green : .secondary)
+                    Text(resident ? "in RAM" : "on disk")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                .frame(width: 64)
+            } else {
+                Button {
+                    Task { await vm.downloadAdapter(choice) }
+                } label: {
+                    HStack(spacing: 4) {
+                        if vm.downloading == choice {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.down.circle")
+                        }
+                        Text(vm.downloading == choice ? "…" : "Get")
+                    }
+                    .frame(width: 64)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+                .disabled(vm.downloading != nil || vm.isRunning || vm.isBenchmarking || !vm.isReady)
             }
         }
     }

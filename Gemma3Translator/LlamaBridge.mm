@@ -52,8 +52,8 @@ static void LogCpuFeatures() {
     int                _nThreads;
     // Dynamic LoRA: adapters are owned (init'd against _model) and kept resident
     // so swapping is just a llama_set_adapters_lora() call on the live context.
-    std::vector<llama_adapter_lora *>     _adapters;       // owned, freed in dealloc
-    std::unordered_map<std::string, int>  _adapterIndex;   // identifier -> _adapters[]
+    // identifier -> owned adapter handle (freed in dealloc or via -unloadAdapter:).
+    std::unordered_map<std::string, llama_adapter_lora *> _adapters;
 }
 
 - (instancetype)init {
@@ -63,22 +63,27 @@ static void LogCpuFeatures() {
         _vocab = nullptr;
         _benchmark = false;
         _isThinking = false;
-        // Decode is compute-bound on the generic Q1_0 ARM kernel and scales with
-        // cores (measured on A12: 2 thr = 4.7 tok/s < 4 thr = 5.5), so use all of
-        // them. Cap at 8 to avoid oversubscription on bigger SoCs.
-        unsigned hw = std::thread::hardware_concurrency();
-        _nThreads = (int)std::max(1u, std::min(8u, hw ? hw : 4u));
+        // Pin inference to the PERFORMANCE-core cluster only. Batch-1 decode is
+        // memory-bound; spilling onto efficiency cores barely raises tok/s but
+        // pushes CPU usage to ~500%+ (6 threads on A12) and wastes power/thermal.
+        // LiteRT-LM runs ~250% by doing the same. perflevel0 = the P-core cluster
+        // (A12: 2). Fall back to ~half the logical cores if the sysctl is absent.
+        int perf = SysctlInt("hw.perflevel0.logicalcpu");
+        if (perf <= 0) {
+            unsigned hw = std::thread::hardware_concurrency();
+            perf = (int)std::max(1u, std::min(4u, (hw ? hw : 4u) / 2u));
+        }
+        _nThreads = std::max(1, perf);
     }
     return self;
 }
 
 - (void)dealloc {
     // Free adapters before the model/context they were initialised against.
-    for (llama_adapter_lora *a : _adapters) {
-        if (a) llama_adapter_lora_free(a);
+    for (auto &kv : _adapters) {
+        if (kv.second) llama_adapter_lora_free(kv.second);
     }
     _adapters.clear();
-    _adapterIndex.clear();
     if (_ctx)   llama_free(_ctx);
     if (_model) llama_model_free(_model);
 }
@@ -334,16 +339,31 @@ static void LogCpuFeatures() {
 
     // Replace an existing adapter under the same id (free the old one first).
     std::string key = identifier.UTF8String;
-    auto it = _adapterIndex.find(key);
-    if (it != _adapterIndex.end()) {
-        if (_adapters[it->second]) llama_adapter_lora_free(_adapters[it->second]);
-        _adapters[it->second] = adapter;
-    } else {
-        _adapterIndex[key] = (int)_adapters.size();
-        _adapters.push_back(adapter);
+    auto it = _adapters.find(key);
+    if (it != _adapters.end() && it->second) {
+        llama_adapter_lora_free(it->second);
     }
-    fprintf(stderr, "[[LORA]] loaded adapter '%s' from %s\n",
-            key.c_str(), path.UTF8String);
+    _adapters[key] = adapter;
+    fprintf(stderr, "[[LORA]] loaded adapter '%s' from %s (resident=%zu)\n",
+            key.c_str(), path.UTF8String, _adapters.size());
+    return YES;
+}
+
+- (BOOL)unloadAdapter:(NSString *)identifier {
+    _lastError.clear();
+    std::string key = identifier.UTF8String ?: "";
+    auto it = _adapters.find(key);
+    if (it == _adapters.end()) {
+        _lastError = std::string("unloadAdapter: not loaded: ") + key;
+        return NO;
+    }
+    // If it's the active one, detach from the context first to avoid a dangling
+    // adapter pointer on the next decode.
+    llama_set_adapters_lora(_ctx, nullptr, 0, nullptr);
+    if (it->second) llama_adapter_lora_free(it->second);   // frees its ~30MB buffer
+    _adapters.erase(it);
+    fprintf(stderr, "[[LORA]] unloaded adapter '%s' (resident=%zu)\n",
+            key.c_str(), _adapters.size());
     return YES;
 }
 
@@ -358,13 +378,13 @@ static void LogCpuFeatures() {
         return YES;
     }
 
-    auto it = _adapterIndex.find(identifier.UTF8String);
-    if (it == _adapterIndex.end()) {
+    auto it = _adapters.find(identifier.UTF8String);
+    if (it == _adapters.end()) {
         _lastError = std::string("adapter not loaded: ") + identifier.UTF8String;
         return NO;
     }
 
-    llama_adapter_lora *adapters[1] = { _adapters[it->second] };
+    llama_adapter_lora *adapters[1] = { it->second };
     float scales[1] = { scale };
     llama_set_adapters_lora(_ctx, adapters, 1, scales);
     fprintf(stderr, "[[LORA]] active adapter '%s' scale=%.2f\n",

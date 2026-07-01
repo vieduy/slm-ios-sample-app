@@ -31,7 +31,14 @@ enum AdapterChoice: String, CaseIterable, Identifiable {
 final class TranslationViewModel: ObservableObject {
 
     @Published var direction: TranslationDirection = .enToVi
-    @Published var adapter: AdapterChoice = .base
+    // Both task adapters are download-on-demand (nothing pre-loaded). A "Translate
+    // N" button is enabled only once its adapter has been downloaded + hot-loaded.
+    @Published var adapter: AdapterChoice = .adapter1        // last-activated adapter
+    // Only-active-resident policy: files persist on disk once downloaded, but at
+    // most ONE adapter's weights are held in RAM at a time.
+    @Published var downloadedAdapters: Set<AdapterChoice> = []  // present on disk (gates Translate)
+    @Published var residentAdapters: Set<AdapterChoice> = []    // adapters currently loaded in RAM
+    @Published var downloading: AdapterChoice? = nil            // in-flight download, if any
     @Published var output: String = ""
     @Published var isRunning: Bool = false
     @Published var isReady: Bool = false
@@ -152,35 +159,141 @@ final class TranslationViewModel: ObservableObject {
     /// Whether the loaded runtime supports dynamic LoRA (llama.cpp only).
     var supportsAdapters: Bool { runtime == .llamaCpp }
 
-    /// Load every bundled adapter onto the current engine, then apply the active
-    /// selection. No-op unless the llama.cpp runtime is loaded. Adapter-load
-    /// failures are non-fatal (logged) so the base model stays usable.
-    private func installAdapters() {
-        guard let engine, runtime == .llamaCpp else { return }
-        for choice in AdapterChoice.allCases {
-            guard let name = choice.resourceName,
-                  let path = ResourceLookup.path(name, ext: "gguf") else { continue }
-            if !engine.loadAdapter(path: path, identifier: name) {
-                FileHandle.standardError.write(Data(
-                    "[[LORA]] load failed for \(name): \(engine.lastError)\n".utf8))
-            }
-        }
-        _ = engine.setActiveAdapter(adapter.resourceName, scale: 1.0)
+    /// A Translate button is enabled once its adapter file is on disk
+    /// (downloaded). The actual RAM load happens lazily, on first use.
+    func isAdapterReady(_ choice: AdapterChoice) -> Bool { downloadedAdapters.contains(choice) }
+
+    /// Writable Documents path the "downloaded" adapter lives at (the app bundle
+    /// is read-only, so downloads must land here).
+    private func adapterURL(for choice: AdapterChoice) -> URL? {
+        guard let name = choice.resourceName else { return nil }
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+            .first?.appendingPathComponent("\(name).gguf")
     }
 
-    /// Switch the active LoRA adapter on the live engine — instant, no model
-    /// reload (the base model stays resident). `.base` reverts to the unmodified
-    /// model.
-    func setAdapter(_ choice: AdapterChoice) {
-        adapter = choice
-        guard let engine, runtime == .llamaCpp, isReady else { return }
-        if engine.setActiveAdapter(choice.resourceName, scale: 1.0) {
-            output = ""
-            timing = choice == .base ? "Adapter: base model"
-                                     : "Adapter: \(choice.label)"
-        } else {
-            errorMessage = engine.lastError
+    /// Re-scan state after every engine (re)load. Files persist on disk; RAM
+    /// handles do NOT (they're tied to the model instance and die with it), so
+    /// mark nothing resident — the next Translate re-loads on demand.
+    private func installAdapters() {
+        guard runtime == .llamaCpp else { downloadedAdapters = []; residentAdapters = []; return }
+        var onDisk: Set<AdapterChoice> = []
+        for choice in [AdapterChoice.adapter1, .adapter2] {
+            if let url = adapterURL(for: choice),
+               FileManager.default.fileExists(atPath: url.path) { onDisk.insert(choice) }
         }
+        downloadedAdapters = onDisk
+        residentAdapters = []
+    }
+
+    /// "Download" an adapter to disk (Documents) — does NOT load it into RAM.
+    /// This is the point of the only-active-resident policy: downloaded ≠ in RAM.
+    /// (Real apps URLSession-fetch the .gguf; here we copy the bundled file.)
+    func downloadAdapter(_ choice: AdapterChoice) async {
+        guard runtime == .llamaCpp,
+              let name = choice.resourceName,
+              let dest = adapterURL(for: choice) else { return }
+        guard downloading == nil, !downloadedAdapters.contains(choice) else { return }
+        downloading = choice
+        errorMessage = nil
+        timing = "Downloading \(choice.label)…"
+
+        let copied: Bool = await Task.detached(priority: .userInitiated) {
+            guard let src = ResourceLookup.path(name, ext: "gguf") else { return false }
+            try? FileManager.default.removeItem(at: dest)
+            do { try FileManager.default.copyItem(atPath: src, toPath: dest.path); return true }
+            catch { return false }
+        }.value
+        downloading = nil
+        if copied {
+            downloadedAdapters.insert(choice)
+            let fp = Double(MemoryFootprint.currentBytes() ?? 0) / 1_048_576
+            timing = String(format: "%@ downloaded (on disk, 0 MB RAM) · footprint %.0f MB",
+                            choice.label, fp)
+        } else {
+            errorMessage = "\(choice.label) download (copy) failed."
+            timing = nil
+        }
+    }
+
+    /// Make `choice` the SINGLE resident adapter: free every OTHER resident
+    /// adapter, then load `choice`. Reports the freed / loaded MB so you can see
+    /// only one adapter's weights (~30 MB) live at a time. Returns false on error.
+    private func makeResident(_ choice: AdapterChoice) -> Bool {
+        guard let engine, let name = choice.resourceName, let url = adapterURL(for: choice) else { return false }
+        if residentAdapters == [choice] { return true }   // already the only resident one
+
+        let before = MemoryFootprint.currentBytes() ?? 0
+        for prev in residentAdapters where prev != choice {
+            if let prevName = prev.resourceName { _ = engine.unloadAdapter(prevName) }  // free ~30 MB each
+        }
+        residentAdapters = residentAdapters.filter { $0 == choice }
+        let afterFree = MemoryFootprint.currentBytes() ?? 0
+
+        var loadMs = 0.0   // the switch latency: cost of re-loading from disk
+        if !residentAdapters.contains(choice) {
+            let t0 = Date()
+            guard FileManager.default.fileExists(atPath: url.path),
+                  engine.loadAdapter(path: url.path, identifier: name) else {
+                errorMessage = "Load failed: \(engine.lastError)"
+                return false
+            }
+            loadMs = Date().timeIntervalSince(t0) * 1000
+            residentAdapters.insert(choice)
+        }
+        let afterLoad = MemoryFootprint.currentBytes() ?? 0
+
+        let freedMB  = (Double(before)    - Double(afterFree)) / 1_048_576
+        let loadedMB = (Double(afterLoad) - Double(afterFree)) / 1_048_576
+        let totalMB  =  Double(afterLoad) / 1_048_576
+        FileHandle.standardError.write(Data(String(format:
+            "[[LORA-RAM]] resident→%@  freed=%.0fMB loaded=%.0fMB loadLatency=%.0fms  footprint=%.0fMB\n",
+            name, max(0, freedMB), max(0, loadedMB), loadMs, totalMB).utf8))
+        timing = String(format: "RAM: freed %.0f MB, loaded %@ %.0f MB in %.0f ms · footprint %.0f MB (1 resident)",
+                        max(0, freedMB), choice.label, max(0, loadedMB), loadMs, totalMB)
+        return true
+    }
+
+    /// Diagnostic: load BOTH downloaded adapters into RAM at once (keep-all-
+    /// resident), so you can compare footprint against the only-active policy.
+    /// Expect ~2× the single-adapter RAM. Adapters must be downloaded first.
+    func loadBothAdapters() async {
+        guard runtime == .llamaCpp, let engine else { return }
+        let targets = [AdapterChoice.adapter1, .adapter2].filter { downloadedAdapters.contains($0) }
+        guard !targets.isEmpty else {
+            errorMessage = "Download the adapters first."
+            return
+        }
+        let before = MemoryFootprint.currentBytes() ?? 0
+        for choice in targets where !residentAdapters.contains(choice) {
+            guard let name = choice.resourceName, let url = adapterURL(for: choice),
+                  FileManager.default.fileExists(atPath: url.path),
+                  engine.loadAdapter(path: url.path, identifier: name) else {
+                errorMessage = "Load failed: \(engine.lastError)"
+                continue
+            }
+            residentAdapters.insert(choice)
+        }
+        let after = MemoryFootprint.currentBytes() ?? 0
+        let loadedMB = (Double(after) - Double(before)) / 1_048_576
+        let totalMB  =  Double(after) / 1_048_576
+        FileHandle.standardError.write(Data(String(format:
+            "[[LORA-RAM]] loadBoth resident=%d  loaded=%.0fMB  footprint=%.0fMB\n",
+            residentAdapters.count, max(0, loadedMB), totalMB).utf8))
+        timing = String(format: "%d adapters resident · +%.0f MB · footprint %.0f MB",
+                        residentAdapters.count, max(0, loadedMB), totalMB)
+    }
+
+    /// Per-adapter Translate: ensure `choice` is the resident adapter (loading it
+    /// and freeing the other), activate it, then translate.
+    func translate(using choice: AdapterChoice, _ text: String) async {
+        guard runtime == .llamaCpp, let engine, downloadedAdapters.contains(choice) else { return }
+        guard makeResident(choice) else { return }
+        guard engine.setActiveAdapter(choice.resourceName, scale: 1.0) else {
+            errorMessage = engine.lastError
+            return
+        }
+        adapter = choice
+        await translate(text)
     }
 
     /// Build a backend-specific GemmaBridge, or nil if Init fails. The kernel

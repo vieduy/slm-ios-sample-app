@@ -19,11 +19,13 @@ protocol InferenceEngine: AnyObject {
     // falls through to the no-op defaults below (its text-LoRA call is stubbed).
     func loadAdapter(path: String, identifier: String) -> Bool
     func setActiveAdapter(_ identifier: String?, scale: Float) -> Bool
+    func unloadAdapter(_ identifier: String) -> Bool
 }
 
 extension InferenceEngine {
     func loadAdapter(path: String, identifier: String) -> Bool { false }
     func setActiveAdapter(_ identifier: String?, scale: Float) -> Bool { false }
+    func unloadAdapter(_ identifier: String) -> Bool { false }
 }
 
 extension GemmaBridge: InferenceEngine {}

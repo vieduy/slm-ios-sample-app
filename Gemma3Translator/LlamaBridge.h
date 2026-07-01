@@ -73,6 +73,12 @@ NS_ASSUME_NONNULL_BEGIN
                    scale:(float)scale
     NS_SWIFT_NAME(setActiveAdapter(_:scale:));
 
+/// Free a previously-loaded adapter, releasing its (~30 MB) buffer from RAM. If
+/// it was the active one it is detached from the context first. Used by the
+/// "only the active adapter is resident" policy. Returns NO if not loaded.
+- (BOOL)unloadAdapter:(NSString *)identifier
+    NS_SWIFT_NAME(unloadAdapter(_:));
+
 @property (nonatomic, readonly, copy) NSString *lastError;
 
 @end
